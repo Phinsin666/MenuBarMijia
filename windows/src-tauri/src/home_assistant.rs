@@ -26,8 +26,8 @@ fn endpoint(base_url: &str, token: &str) -> Result<String, String> {
         return Err("Home Assistant token is required".into());
     }
     let mut url = reqwest::Url::parse(base_url.trim()).map_err(|_| "Invalid Home Assistant URL")?;
-    if url.query().is_some() || url.fragment().is_some() || url.path() != "/" {
-        return Err("Home Assistant URL must be an origin".into());
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("Home Assistant URL cannot contain a query or fragment".into());
     }
     let origin =
         crate::url_origin(&url).ok_or("Home Assistant requires an HTTP or HTTPS origin")?;
@@ -37,7 +37,8 @@ fn endpoint(base_url: &str, token: &str) -> Result<String, String> {
     let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
     url.set_scheme(scheme)
         .map_err(|_| "Invalid Home Assistant URL")?;
-    url.set_path("/api/websocket");
+    let path = format!("{}/api/websocket", url.path().trim_end_matches('/'));
+    url.set_path(&path);
     Ok(url.to_string())
 }
 
@@ -223,6 +224,7 @@ pub async fn ha_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tungstenite::handshake::server::{Request, Response};
     #[test]
     fn rejects_missing_tokens_and_non_http_origins() {
         assert!(endpoint("http://localhost:8123", "").is_err());
@@ -250,12 +252,18 @@ mod tests {
     fn controlled_websocket_auth_snapshot_and_service_smoke() {
         let _guard = crate::ORIGIN_TEST_LOCK.lock().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let origin = crate::normalize_extra_origin(&base_url).unwrap();
+        let address = listener.local_addr().unwrap();
+        let root_url = format!("http://{address}");
+        let base_url = format!("{root_url}/ha/Smart%20Home/");
+        let origin = crate::normalize_extra_origin(&root_url).unwrap();
         crate::EXTRA_ALLOWED_ORIGINS
             .write()
             .unwrap()
             .insert(origin.clone());
+        for suffix in ["?filter=on", "#section"] {
+            assert!(endpoint(&format!("{base_url}{suffix}"), "example").is_err());
+        }
+        assert!(endpoint(&format!("http://user@{address}/ha"), "example").is_err());
         let fixture: Value =
             serde_json::from_str(include_str!("../../../Tests/Fixtures/ha_snapshot.json")).unwrap();
         let peer = std::thread::spawn(move || {
@@ -267,7 +275,19 @@ mod tests {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
-                let mut socket = tungstenite::accept(stream).unwrap();
+                let mut socket = tungstenite::accept_hdr(
+                    stream,
+                    |request: &Request, response: Response| {
+                        let expected_path = if connection == 0 {
+                            "/api/websocket"
+                        } else {
+                            "/ha/Smart%20Home/api/websocket"
+                        };
+                        assert_eq!(request.uri().path(), expected_path);
+                        Ok(response)
+                    },
+                )
+                .unwrap();
                 socket
                     .send(Message::Text(
                         json!({"type":"auth_required","ha_version":"controlled-fixture"})
@@ -330,10 +350,10 @@ mod tests {
             (handshakes, snapshots, services)
         });
         let mut snapshot_ms = Vec::new();
-        for _ in 0..5 {
+        for url in [&root_url, &base_url, &base_url, &base_url, &base_url] {
             let start = std::time::Instant::now();
             let snapshot = tauri::async_runtime::block_on(ha_snapshot(
-                base_url.clone(),
+                url.clone(),
                 "controlled-native-token".into(),
             ))
             .unwrap();
